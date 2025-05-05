@@ -1,122 +1,94 @@
-import ccxt
-import pandas as pd
+from datetime import datetime, timedelta, timezone
 import time
 import os
-from dotenv import load_dotenv
-from ta.momentum import RSIIndicator
-from datetime import datetime, timedelta
+import ccxt
+import pytz
 
 # Load environment variables
-load_dotenv()
-api_key = os.getenv("BINANCE_API_KEY")
-api_secret = os.getenv("BINANCE_API_SECRET")
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-# Connect to Binance.US
 exchange = ccxt.binanceus({
-    'apiKey': api_key,
-    'secret': api_secret,
+    'apiKey': API_KEY,
+    'secret': API_SECRET,
     'enableRateLimit': True,
 })
 
-# Bot configuration
-symbol = "BTC/USDT"
-rsi_buy = 30
-timeframe = "1h"
-limit = 200
-trade_usdt_amount = 100
-daily_usdt_limit = 1000
+symbol = 'BTC/USDT'
+timeframe = '1m'
+rsi_period = 14
+check_interval = 60
+trade_amount_usdt = 100
 stop_loss_pct = 0.10
 take_profit_pct = 0.05
-check_interval = 60  # in seconds
+daily_limit_usdt = 1000
 
-# Track USDT spent over the last 24 hours
 trade_log = []
 
-# Functions
-def current_spend():
-    cutoff = datetime.utcnow() - timedelta(hours=24)
-    return sum(t["amount"] for t in trade_log if t["timestamp"] > cutoff)
+def fetch_rsi():
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe)
+    closes = [x[4] for x in ohlcv]
+    deltas = [closes[i + 1] - closes[i] for i in range(len(closes) - 1)]
+    gains = [delta if delta > 0 else 0 for delta in deltas]
+    losses = [-delta if delta < 0 else 0 for delta in deltas]
+    avg_gain = sum(gains[-rsi_period:]) / rsi_period
+    avg_loss = sum(losses[-rsi_period:]) / rsi_period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-def log_trade(usdt_amount):
-    trade_log.append({
-        "timestamp": datetime.utcnow(),
-        "amount": usdt_amount
-    })
+def get_current_price():
+    ticker = exchange.fetch_ticker(symbol)
+    return ticker['last']
 
-def fetch_price():
-    return exchange.fetch_ticker(symbol)['last']
+def place_buy_order(amount):
+    print(f"🟢 Placing buy for ${amount} USDT of BTC", flush=True)
+    order = exchange.create_market_buy_order(symbol, amount / get_current_price())
+    return get_current_price()
 
-def place_buy(usdt_amount):
-    price = fetch_price()
-    amount = round(usdt_amount / price, 6)
-    order = exchange.create_market_buy_order(symbol, amount)
-    print(f"✅ BUY: {amount} BTC @ ${price:.2f}")
-    log_trade(usdt_amount)
-    return amount, price
+def place_partial_sell_order(buy_price, take_profit_pct):
+    sell_amount = trade_amount_usdt * take_profit_pct / get_current_price()
+    print(f"🔼 Selling ${trade_amount_usdt * take_profit_pct:.2f} profit (partial) at profit target", flush=True)
+    order = exchange.create_market_sell_order(symbol, sell_amount)
+    return order
 
-def place_partial_sell(btc_total, entry_price, current_price):
-    gain_pct = (current_price - entry_price) / entry_price
-    if gain_pct < take_profit_pct:
-        return False
+def get_total_spent_24h():
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    return sum([amt for ts, amt in trade_log if ts > cutoff])
 
-    profit_usdt = trade_usdt_amount * gain_pct
-    sell_amount = round(profit_usdt / current_price, 6)
-    sell_amount = min(sell_amount, btc_total)
+def main():
+    print("🚀 Starting RSI Bot — Live Trading w/ Stop-Loss, Profit-Take & 24hr Cap", flush=True)
+    state = 'ready_to_buy'
+    buy_price = 0.0
 
-    if sell_amount < 0.00001:
-        print("⚠️ Profit too small to sell.")
-        return False
+    while True:
+        try:
+            current_price = get_current_price()
+            rsi = fetch_rsi()
+            spend_total = get_total_spent_24h()
+            print(f"\n⏱ {datetime.now(timezone.utc).isoformat()} | Price: ${current_price:.2f} | RSI: {rsi:.2f} | State: {state}", flush=True)
+            print(f"📊 24hr Spend Total: ${spend_total:.2f}", flush=True)
 
-    exchange.create_market_sell_order(symbol, sell_amount)
-    print(f"💰 TAKE-PROFIT: Sold {sell_amount} BTC (≈ ${profit_usdt:.2f})")
-    return sell_amount
-
-def fetch_ohlcv():
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df
-
-def stop_loss_hit(entry, current):
-    return current <= entry * (1 - stop_loss_pct)
-
-# Main loop
-print("🚀 Starting RSI Bot — Live Trading w/ Stop-Loss, Profit-Take & 24hr Cap")
-state = "ready_to_buy"
-btc_balance = 0
-entry_price = 0
-
-while True:
-    try:
-        df = fetch_ohlcv()
-        rsi = RSIIndicator(close=df['close'], window=14).rsi().iloc[-1]
-        current_price = df['close'].iloc[-1]
-        print(f"\n⏱ {datetime.utcnow().isoformat()} | Price: ${current_price:.2f} | RSI: {rsi:.2f} | State: {state}")
-
-        spent_today = current_spend()
-        print(f"📊 24hr Spend Total: ${spent_today:.2f}")
-
-        if state == "ready_to_buy":
-            if spent_today + trade_usdt_amount > daily_usdt_limit:
-                print("⛔ Skipping buy — 24hr spend limit reached.")
-            elif rsi < rsi_buy:
-                btc_balance, entry_price = place_buy(trade_usdt_amount)
-                state = "holding"
+            if state == 'ready_to_buy' and rsi < 30 and spend_total + trade_amount_usdt <= daily_limit_usdt:
+                buy_price = place_buy_order(trade_amount_usdt)
+                trade_log.append((datetime.now(timezone.utc), trade_amount_usdt))
+                state = 'holding'
+            elif state == 'holding':
+                if current_price <= buy_price * (1 - stop_loss_pct):
+                    print(f"🔻 Price dropped to stop-loss level (${current_price:.2f}) — exiting position", flush=True)
+                    state = 'ready_to_buy'
+                elif current_price >= buy_price * (1 + take_profit_pct):
+                    place_partial_sell_order(buy_price, take_profit_pct)
+                    state = 'ready_to_buy'
+                else:
+                    print("⏳ Holding position...", flush=True)
             else:
-                print("⏸ No buy signal...")
+                print("⏸ No buy signal...", flush=True)
 
-        elif state == "holding":
-            if stop_loss_hit(entry_price, current_price):
-                exchange.create_market_sell_order(symbol, btc_balance)
-                print(f"🛑 STOP-LOSS: Sold {btc_balance} BTC @ ${current_price:.2f}")
-                btc_balance = 0
-                state = "ready_to_buy"
-            else:
-                sold = place_partial_sell(btc_balance, entry_price, current_price)
-                if sold:
-                    btc_balance -= sold
+            time.sleep(check_interval)
+        except Exception as e:
+            print(f"❌ Error: {str(e)}", flush=True)
+            time.sleep(10)
 
-    except Exception as e:
-        print(f"❌ Error: {str(e)}")
-
-    time.sleep(check_interval)
+main()
